@@ -1,4 +1,4 @@
-# envs/attack_env.py
+# envs/attack_env.py (V1 sencillo)
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces

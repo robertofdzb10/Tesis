@@ -1,4 +1,4 @@
-# envs/multi_step_attack_env.py
+# envs/multi_step_attack_env.py (V2 con multi-step)
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
