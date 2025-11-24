@@ -1,18 +1,18 @@
-# envs/multi_step_attack_env.py (V2 con multi-step)
+# envs/multi_step_limited_attack_env.py (V3 con límite de "zona de ataque")
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
 
-class AttackEnvMultiStep(gym.Env):
+class AttackEnvLimitedMultiStep(gym.Env):
     """
     Entorno donde el atacante puede modificar un mismo ataque durante varios pasos.
-    - Estado: punto 2D actual (x_adv) y, opcionalmente, el original.
+    - Estado: punto 2D actual (x_adv).
     - Acción: delta_x, delta_y en [-epsilon, epsilon].
     - Recompensa:
-        - pequeña señal en cada paso si reduce la prob de ser ataque,
-        - recompensa final fuerte si evade al clasificador,
-        - penalización por perturbación grande acumulada.
+        - señal densa si reduce la prob de ser ataque,
+        - recompensa final fuerte si evade al clasificador SIN alejarse demasiado del ataque original,
+        - penalización por perturbación grande.
     """
 
     metadata = {"render_modes": []}
@@ -22,9 +22,10 @@ class AttackEnvMultiStep(gym.Env):
         attack_samples: np.ndarray,
         clf,
         threshold: float = 0.5,
-        epsilon: float = 0.5,
-        penalty: float = 0.01,
-        max_steps: int = 5, # Número máximo de pasos por episodio
+        epsilon: float = 0.2,   # Más pequeño para no pegar saltos enormes
+        penalty: float = 0.05,  # Penalización un poco más fuerte
+        max_steps: int = 5,
+        max_norm: float = 1,  # Radio máximo desde el ataque original
     ):
         super().__init__()
 
@@ -35,6 +36,7 @@ class AttackEnvMultiStep(gym.Env):
         self.epsilon = float(epsilon)
         self.penalty = float(penalty)
         self.max_steps = int(max_steps)
+        self.max_norm = float(max_norm)
 
         self.action_space = spaces.Box(
             low=-self.epsilon,
@@ -47,29 +49,25 @@ class AttackEnvMultiStep(gym.Env):
         high = np.array([10.0, 10.0], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
-        # Añadimos nuevas variables para el entorno multi-step
         self.rng = np.random.default_rng(42)
         self.x_orig = None
-        self.x_adv = None # Estado actual (punto adversarial)
-        self.step_count = 0 # Contador de pasos en el episodio
+        self.x_adv = None
+        self.step_count = 0
 
     def _sample_attack(self):
         idx = self.rng.integers(0, len(self.attack_samples))
         return self.attack_samples[idx]
 
-    # Función para obtener la probabilidad de que un punto sea clasificado como ataque
     def _p_attack(self, x):
-        return float(self.clf.predict_proba(x.reshape(1, -1))[0, 1]) # La función devuevle la probabilidad de que x sea un ataque segun el clasificador 
+        return float(self.clf.predict_proba(x.reshape(1, -1))[0, 1])
 
     def reset(self, *, seed=None, options=None):
-
         super().reset(seed=seed)
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        # Añadimos nuevas variables para el entorno multi-step
         self.x_orig = self._sample_attack()
-        self.x_adv = self.x_orig.copy() # Estado actual (punto adversarial)
+        self.x_adv = self.x_orig.copy()
         self.step_count = 0
 
         obs = self.x_adv.astype(np.float32)
@@ -82,52 +80,45 @@ class AttackEnvMultiStep(gym.Env):
 
     def step(self, action):
 
-        # Incrementamos el contador de pasos
         self.step_count += 1
 
-        # Aplicamos la acción con clipping para no exceder epsilon
         delta = np.clip(action, -self.epsilon, self.epsilon)
 
-        # Probabilidad del ataque antes de aplicar la acción
         prev_p_attack = self._p_attack(self.x_adv)
 
-        # Actualizamos el punto adversarial
         self.x_adv = self.x_adv + delta
 
-        # Calculamos la nueva probabilidad de ser clasificado como ataque
-        p_attack = self._p_attack(self.x_adv)
+        # Cálculamos la distancia al ataque original
+        dist = float(np.linalg.norm(self.x_adv - self.x_orig))
 
-        # Predicción del clasificador con el nuevo punto adversarial
+        # Comprobamos si estamos fuera del radio máximo permitido
+        if dist > self.max_norm:
+            # Proyectamos el punto de vuelta al borde del círculo permitido
+            direction = (self.x_adv - self.x_orig) / (dist + 1e-8) # Calculamos la dirección desde el original al adversarial
+            self.x_adv = self.x_orig + direction * self.max_norm # Proyectamos el punto adversarial al borde del círculo permitido
+            dist = self.max_norm # Actualizamos la distancia al máximo permitido
+
+        p_attack = self._p_attack(self.x_adv)
         pred = int(p_attack >= self.threshold)
 
-        # Recompensa inicial
         reward = 0.0
 
-        # Si logramos que la probabilidad de ataque final sea menor que la inicial, damos recompensa
-        reward += (prev_p_attack - p_attack) # La recompensa es cuanto hemos conseguido reducir la probabilidad de ser clasificado como ataque, cuanto más reducción, más recompensa
+        reward += (prev_p_attack - p_attack)
 
-        # Penalización por perturbación grande, queremos que el agente sea sigiloso
-        reward -= self.penalty * float(np.sum(delta**2)) # La penalización es proporcional al tamaño del cambio realizado
+        reward -= self.penalty * float(np.sum(delta**2))
 
-        # Episodio no termina hasta que se alcance el máximo de pasos
         terminated = False
         truncated = False
-
-        # Inicializamos el indicador de éxito
         success = 0
 
-        # Si llegamos al último paso del episodio:
         if self.step_count >= self.max_steps:
-
-            # Marcamos el episodio como terminado
             truncated = True
 
-            # Si hemos evadido al clasificador, damos una recompensa fuerte
-            if pred == 0:
-                reward += 1.0 # Recompensa fuerte por evadir al clasificador
-                success = 1 # Indicador de éxito
+            # Damos por valida la evasión si el clasificador no lo detecta como ataque y estamos dentro del radio permitido
+            if pred == 0 and dist <= self.max_norm:
+                reward += 1.0
+                success = 1
 
-        # Información adicional 
         info = {
             "x_orig": self.x_orig.copy(),
             "x_adv": self.x_adv.copy(),
@@ -135,11 +126,10 @@ class AttackEnvMultiStep(gym.Env):
             "step_count": self.step_count,
             "pred": pred,
             "success": success,
+            "dist": dist, # Distancia al ataque original
         }
 
-        # Preparamos la siguiente observación
         obs = self.x_adv.astype(np.float32)
-
         return obs, reward, terminated, truncated, info
 
     def render(self):
